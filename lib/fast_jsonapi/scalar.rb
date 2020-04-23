@@ -1,20 +1,29 @@
+# frozen_string_literal: true
+
 module FastJsonapi
   class Scalar
-    attr_reader :key, :method, :conditional_proc
+    include FastJsonapi::HextupleSerializer
+
+    attr_reader :key, :method, :predicate, :conditional_proc
 
     def initialize(key:, method:, options: {})
       @key = key
       @method = method
       @conditional_proc = options[:if]
+      @predicate = options[:predicate]
     end
 
-    def serialize(record, serialization_params, output_hash)
-      if conditionally_allowed?(record, serialization_params)
-        output_hash[key] = if method.is_a?(Proc)
-          FastJsonapi.call_proc(method, record, serialization_params)
-        else
-          record.public_send(method)
-        end
+    def serialize(record, serialization_params)
+      return [] unless conditionally_allowed?(record, serialization_params)
+
+      value = value_from_record(record, method)
+
+      return [] if value.nil?
+
+      if value.is_a?(Array)
+        value.map { |arr_item| value_to_hex(record, predicate, arr_item) }
+      else
+        [value_to_hex(record, predicate, value)]
       end
     end
 
@@ -23,6 +32,15 @@ module FastJsonapi
         FastJsonapi.call_proc(conditional_proc, record, serialization_params)
       else
         true
+      end
+    end
+
+    def value_from_record(record, method)
+      if method.is_a?(Proc)
+        method.arity.abs == 1 ? method.call(record) : method.call(record, params)
+      else
+        v = record.public_send(method)
+        v.is_a?(ActiveRecord::Relation) ? v.to_a : v
       end
     end
   end

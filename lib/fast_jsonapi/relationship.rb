@@ -1,11 +1,17 @@
 module FastJsonapi
   class Relationship
-    attr_reader :owner, :key, :name, :id_method_name, :record_type, :object_method_name, :object_block, :serializer, :relationship_type, :cached, :polymorphic, :conditional_proc, :transform_method, :links, :lazy_load_data
+    include FastJsonapi::HextupleSerializer
+
+    attr_reader :owner, :key, :name, :predicate, :id_method_name, :record_type,
+                :object_method_name, :object_block, :serializer,
+                :relationship_type, :cached, :polymorphic, :conditional_proc,
+                :transform_method, :lazy_load_data
 
     def initialize(
       owner:,
       key:,
       name:,
+      predicate:,
       id_method_name:,
       record_type:,
       object_method_name:,
@@ -16,12 +22,12 @@ module FastJsonapi
       polymorphic:,
       conditional_proc:,
       transform_method:,
-      links:,
       lazy_load_data: false
     )
       @owner = owner
       @key = key
       @name = name
+      @predicate = predicate
       @id_method_name = id_method_name
       @record_type = record_type
       @object_method_name = object_method_name
@@ -32,26 +38,30 @@ module FastJsonapi
       @polymorphic = polymorphic
       @conditional_proc = conditional_proc
       @transform_method = transform_method
-      @links = links || {}
       @lazy_load_data = lazy_load_data
       @record_types_for = {}
       @serializers_for_name = {}
     end
 
-    def serialize(record, included, serialization_params, output_hash)
-      if include_relationship?(record, serialization_params)
-        empty_case = relationship_type == :has_many ? [] : nil
+    def serialize(record, included, serialization_params)
+      return [] unless include_relationship?(record, serialization_params)
 
-        output_hash[key] = {}
-        unless (lazy_load_data && !included)
-          output_hash[key][:data] = ids_hash_from_record_and_relationship(record, serialization_params) || empty_case
-        end
-        add_links_hash(record, serialization_params, output_hash) if links.present?
+      statements = []
+
+      unless lazy_load_data && !included
+        statements << value_to_hex(
+          record,
+          predicate,
+          iris_from_record_and_relationship(record, serialization_params)
+        )
       end
+
+      statements.compact
     end
 
     def fetch_associated_object(record, params)
       return FastJsonapi.call_proc(object_block, record, params) unless object_block.nil?
+
       record.send(object_method_name)
     end
 
@@ -65,19 +75,15 @@ module FastJsonapi
 
     def serializer_for(record, serialization_params)
       if @static_serializer
-        return @static_serializer
-
+        @static_serializer
       elsif polymorphic
         name = polymorphic[record.class] if polymorphic.is_a?(Hash)
         name ||= record.class.name
         serializer_for_name(name)
-
       elsif serializer.is_a?(Proc)
         FastJsonapi.call_proc(serializer, record, serialization_params)
-
       elsif object_block
         serializer_for_name(record.class.name)
-
       else
         raise "Unknown serializer for object #{record.inspect}"
       end
@@ -95,55 +101,40 @@ module FastJsonapi
 
     private
 
-    def ids_hash_from_record_and_relationship(record, params = {})
+    def iris_from_record_and_relationship(record, params = {})
       initialize_static_serializer unless @initialized_static_serializer
 
-      return ids_hash(fetch_id(record, params), @static_record_type) if @static_record_type
+      return fetch_iri(record, params) if @static_record_type
 
       return unless associated_object = fetch_associated_object(record, params)
 
-      return associated_object.map do |object|
-        id_hash_from_record object, params
-      end if associated_object.respond_to? :map
-
-      id_hash_from_record associated_object, params
-    end
-
-    def id_hash_from_record(record, params)
-      associated_record_type = record_type_for(record, params)
-      id_hash(record.public_send(id_method_name), associated_record_type)
-    end
-
-    def ids_hash(ids, record_type)
-      return ids.map { |id| id_hash(id, record_type) } if ids.respond_to? :map
-      id_hash(ids, record_type) # ids variable is just a single id here
-    end
-
-    def id_hash(id, record_type, default_return=false)
-      if id.present?
-        { id: id.to_s, type: record_type }
-      else
-        default_return ? { id: nil, type: record_type } : nil
+      if associated_object.respond_to? :map
+        return associated_object.map do |object|
+          iri_from_record object
+        end
       end
+
+      iri_from_record associated_object
     end
 
-    def fetch_id(record, params)
+    def iri_from_record(record)
+      record.public_send(id_method_name)&.to_s
+    end
+
+    def ids_hash(iris)
+      return iris.map { |iri| iri&.to_s } if iris.respond_to? :map
+
+      iris&.to_s # iris variable is just a single id here
+    end
+
+    def fetch_iri(record, params)
       if object_block.present?
         object = FastJsonapi.call_proc(object_block, record, params)
         return object.map { |item| item.public_send(id_method_name) } if object.respond_to? :map
+
         return object.try(id_method_name)
       end
       record.public_send(id_method_name)
-    end
-
-    def add_links_hash(record, params, output_hash)
-      if links.is_a?(Symbol)
-        output_hash[key][:links] = record.public_send(links)
-      else
-        output_hash[key][:links] = links.each_with_object({}) do |(key, method), hash|
-          Link.new(key: key, method: method).serialize(record, params, hash)\
-        end
-      end
     end
 
     def run_key_transform(input)
@@ -156,6 +147,7 @@ module FastJsonapi
 
     def initialize_static_serializer
       return if @initialized_static_serializer
+
       @static_serializer = compute_static_serializer
       @static_record_type = compute_static_record_type
       @initialized_static_serializer = true
@@ -185,15 +177,22 @@ module FastJsonapi
         nil
 
       else
+        return serializer_for_association(name) if serializer_for_association(name)
+
         # no serializer information was provided -- infer it from the relationship name
         serializer_name = name.to_s
         serializer_name = serializer_name.singularize if relationship_type.to_sym == :has_many
         serializer_for_name(serializer_name)
+        #  .reflect_on_association(key).class_name
       end
     end
 
     def serializer_for_name(name)
       @serializers_for_name[name] ||= owner.serializer_for(name)
+    end
+
+    def serializer_for_association(name)
+      @serializers_for_name[name] ||= owner.association_serializer_for(name)
     end
 
     def record_type_for(record, serialization_params)

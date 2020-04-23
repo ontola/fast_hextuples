@@ -6,6 +6,12 @@ module FastJsonapi
     # @param [Array<Object>] *params any number of parameters to be passed to the Proc
     # @return [Object] the result of the Proc call with the supplied parameters
     def call_proc(proc, *params)
+      return false if proc == :never
+
+      if proc.is_a?(Symbol)
+        return params[1][:scope].method(proc).call
+      end
+
       proc.call(*params.take(proc.parameters.length))
     end
   end

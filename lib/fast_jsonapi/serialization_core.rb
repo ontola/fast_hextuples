@@ -19,79 +19,61 @@ module FastJsonapi
                       :record_id,
                       :cache_store_instance,
                       :cache_store_options,
-                      :data_links,
                       :meta_to_serialize
       end
     end
 
     class_methods do
-      def id_hash(id, record_type, default_return=false)
-        if id.present?
-          { id: id.to_s, type: record_type }
-        else
-          default_return ? { id: nil, type: record_type } : nil
+      def relationships_hextuples(record, relationships = nil, fieldset = nil, includes_list = [], params = {})
+        relationships = relationships_to_serialize if relationships.nil?
+        relationships = relationships.slice(*fieldset) if fieldset.present?
+        relationships = [] if fieldset == []
+
+        statements = []
+        relationships.each do |key, relationship|
+          included = includes_list.present? && includes_list.include?(key)
+          statements.concat relationship.serialize(record, included, params)
         end
+
+        statements
       end
 
-      def links_hash(record, params = {})
-        data_links.each_with_object({}) do |(_k, link), hash|
-          link.serialize(record, params, hash)
-        end
-      end
-
-      def attributes_hash(record, fieldset = nil, params = {})
+      def attributes_hextuples(record, fieldset = nil, params = {})
         attributes = attributes_to_serialize
         attributes = attributes.slice(*fieldset) if fieldset.present?
         attributes = {} if fieldset == []
 
-        attributes.each_with_object({}) do |(_k, attribute), hash|
-          attribute.serialize(record, params, hash)
+        statements = attributes.flat_map do |k, attr|
+          attr.serialize(record, params)
         end
+
+        statements.compact
       end
 
-      def relationships_hash(record, relationships = nil, fieldset = nil, includes_list = nil, params = {})
-        relationships = relationships_to_serialize if relationships.nil?
-        relationships = relationships.slice(*fieldset) if fieldset.present?
-        relationships = {} if fieldset == []
-
-        relationships.each_with_object({}) do |(key, relationship), hash|
-          included = includes_list.present? && includes_list.include?(key)
-          relationship.serialize(record, included, params, hash)
-        end
-      end
-
-      def meta_hash(record, params = {})
-        FastJsonapi.call_proc(meta_to_serialize, record, params)
-      end
-
-      def record_hash(record, fieldset, includes_list, params = {})
+      def record_hextuples(record, fieldset, includes_list, params = {})
         if cache_store_instance
-          record_hash = cache_store_instance.fetch(record, **cache_store_options) do
-            temp_hash = id_hash(id_from_record(record, params), record_type, true)
-            temp_hash[:attributes] = attributes_hash(record, fieldset, params) if attributes_to_serialize.present?
-            temp_hash[:relationships] = {}
-            temp_hash[:relationships] = relationships_hash(record, cachable_relationships_to_serialize, fieldset, includes_list, params) if cachable_relationships_to_serialize.present?
-            temp_hash[:links] = links_hash(record, params) if data_links.present?
-            temp_hash
+          record_hex = Rails.cache.fetch(record.cache_key, expires_in: cache_length, race_condition_ttl: race_condition_ttl) do
+            temp_hex = []
+            temp_hex.concat attributes_hextuples(record, fieldset, params) if attributes_to_serialize.present?
+            # temp_hex[:relationships] = relationships_hextuples(record, cachable_relationships_to_serialize, fieldset, includes_list, params) if cachable_relationships_to_serialize.present?
+            temp_hex
           end
-          record_hash[:relationships] = record_hash[:relationships].merge(relationships_hash(record, uncachable_relationships_to_serialize, fieldset, includes_list, params)) if uncachable_relationships_to_serialize.present?
-          record_hash[:meta] = meta_hash(record, params) if meta_to_serialize.present?
-          record_hash
+          # record_hex[:relationships] = record_hex[:relationships].concat(relationships_hextuples(record, uncachable_relationships_to_serialize, fieldset, includes_list, params)) if uncachable_relationships_to_serialize.present?
+          record_hex
         else
-          record_hash = id_hash(id_from_record(record, params), record_type, true)
-          record_hash[:attributes] = attributes_hash(record, fieldset, params) if attributes_to_serialize.present?
-          record_hash[:relationships] = relationships_hash(record, nil, fieldset, includes_list, params) if relationships_to_serialize.present?
-          record_hash[:links] = links_hash(record, params) if data_links.present?
-          record_hash[:meta] = meta_hash(record, params) if meta_to_serialize.present?
-          record_hash
+          record_hex = []
+          record_hex.concat attributes_hextuples(record, fieldset, params) if attributes_to_serialize.present?
+          record_hex.concat relationships_hextuples(record, nil, fieldset, params) if relationships_to_serialize.present?
+          record_hex
         end
       end
 
-      def id_from_record(record, params)
+
+      def iri_from_record(record, params)
         return FastJsonapi.call_proc(record_id, record, params) if record_id.is_a?(Proc)
         return record.send(record_id) if record_id
-        raise MandatoryField, 'id is a mandatory field in the jsonapi spec' unless record.respond_to?(:id)
-        record.id
+        raise MandatoryField, 'iri is a mandatory field for linked data' unless record.respond_to?(:iri)
+        record.iri
       end
 
       def parse_include_item(include_item)
@@ -136,12 +118,12 @@ module FastJsonapi
                 included_records.concat(serializer_records) unless serializer_records.empty?
               end
 
-              code = "#{record_type}_#{serializer.id_from_record(inc_obj, params)}"
+              code = "#{record_type}_#{serializer.iri_from_record(inc_obj, params)}"
               next if known_included_objects.key?(code)
 
               known_included_objects[code] = inc_obj
 
-              included_records << serializer.record_hash(inc_obj, fieldsets[record_type], includes_list, params)
+              included_records.concat serializer.record_hextuples(inc_obj, fieldsets[record_type], includes_list, params)
             end
           end
         end
